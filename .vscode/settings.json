@@ -1,0 +1,21 @@
+{
+    "cmake.configureOnOpen": true,
+    "idf.adapterTargetName": "esp32",
+    "files.associations": {
+        "websocket_server.h": "c",
+        "app_config.h": "c",
+        "functional": "c",
+        "array": "c",
+        "string": "c",
+        "string_view": "c",
+        "optional": "c",
+        "istream": "c",
+        "ostream": "c",
+        "ratio": "c",
+        "system_error": "c",
+        "tuple": "c",
+        "type_traits": "c",
+        "utility": "c"
+    },
+    "idf.port": "/dev/ttyUSB0"
+}
