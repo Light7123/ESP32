@@ -4,6 +4,8 @@
 #include "string.h"
 #include "app_wifi.h"
 
+
+
 #define  time_graph  6000 // количество данных в массиве ( с учетом того, что опрос каждые 10 ms, массив даст на выходе 60 с)
 extern xSemaphoreHandle PushDatatoClient; //отвечает за начало передачи данных клиенту 
 
@@ -160,6 +162,16 @@ void transmitUART_task(void *pvParameters)
 			uart_write_bytes(UART_NUM_2, (const char *)"@RESTART\r\n", 10);
 			esp_restart();
 
+		}
+		if(data[0]=='&')
+		{
+			vTaskDelete(server_task);
+			vTaskDelete(server_handle_task);
+			vTaskDelete(transmitUART_task);
+			ESP_ERROR_CHECK(esp_wifi_stop());
+				wifi_state = 0;
+				uart_write_bytes(UART_NUM_2, (const char *)"WiFi-OFF\r\n", 10);
+			xTaskCreate(&app_ota,"app_ota" ,4096, NULL, 2, NULL);
 		}
 		vTaskDelay(pdMS_TO_TICKS(10));
 	}

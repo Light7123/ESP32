@@ -1,235 +1,160 @@
-
-
 #include <string.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/event_groups.h"
-#include "esp_system.h"
-#include "esp_event.h"
-#include "esp_log.h"
-#include "esp_ota_ops.h"
-#include "esp_http_client.h"
-#include "esp_https_ota.h"
-#include "nvs.h"
-#include "nvs_flash.h"
-#include "protocol_examples_common.h"
 
-#if CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK
-#include "esp_efuse.h"
-#endif
+#include <freertos/FreeRTOS.h>
+#include <esp_http_server.h>
+#include <freertos/task.h>
+#include <esp_ota_ops.h>
+#include <esp_system.h>
+#include <nvs_flash.h>
+#include <sys/param.h>
+#include <esp_wifi.h>
 
-#if CONFIG_EXAMPLE_CONNECT_WIFI
-#include "esp_wifi.h"
-#endif
+#define WIFI_SSID "ESP32 OTA Update"
 
-#if CONFIG_BT_BLE_ENABLED || CONFIG_BT_NIMBLE_ENABLED
-#include "ble_api.h"
-#endif
+/*
+ * Serve OTA update portal (index.html)
+ */
+extern const uint8_t index_html_start[] asm("_binary_index_html_start");
+extern const uint8_t index_html_end[] asm("_binary_index_html_end");
 
-static const char *TAG = "advanced_https_ota_example";
-extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
-extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
-
-#define OTA_URL_SIZE 256
-
-static esp_err_t validate_image_header(esp_app_desc_t *new_app_info)
+esp_err_t index_get_handler(httpd_req_t *req)
 {
-    if (new_app_info == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    esp_app_desc_t running_app_info;
-    if (esp_ota_get_partition_description(running, &running_app_info) == ESP_OK) {
-        ESP_LOGI(TAG, "Running firmware version: %s", running_app_info.version);
-    }
-
-#ifndef CONFIG_EXAMPLE_SKIP_VERSION_CHECK
-    if (memcmp(new_app_info->version, running_app_info.version, sizeof(new_app_info->version)) == 0) {
-        ESP_LOGW(TAG, "Current running version is the same as a new. We will not continue the update.");
-        return ESP_FAIL;
-    }
-#endif
-
-#ifdef CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK
-    /**
-     * Secure version check from firmware image header prevents subsequent download and flash write of
-     * entire firmware image. However this is optional because it is also taken care in API
-     * esp_https_ota_finish at the end of OTA update procedure.
-     */
-    const uint32_t hw_sec_version = esp_efuse_read_secure_version();
-    if (new_app_info->secure_version < hw_sec_version) {
-        ESP_LOGW(TAG, "New firmware security version is less than eFuse programmed, %d < %d", new_app_info->secure_version, hw_sec_version);
-        return ESP_FAIL;
-    }
-#endif
-
-    return ESP_OK;
+	httpd_resp_send(req, (const char *) index_html_start, index_html_end - index_html_start);
+	return ESP_OK;
 }
 
-static esp_err_t _http_client_init_cb(esp_http_client_handle_t http_client)
+/*
+ * Handle OTA file upload
+ */
+esp_err_t update_post_handler(httpd_req_t *req)
 {
-    esp_err_t err = ESP_OK;
-    /* Uncomment to add custom headers to HTTP request */
-    // err = esp_http_client_set_header(http_client, "Custom-Header", "Value");
-    return err;
+	char buf[1000];
+	esp_ota_handle_t ota_handle;
+	int remaining = req->content_len;
+
+	const esp_partition_t *ota_partition = esp_ota_get_next_update_partition(NULL);
+	ESP_ERROR_CHECK(esp_ota_begin(ota_partition, OTA_SIZE_UNKNOWN, &ota_handle));
+
+	while (remaining > 0) {
+		int recv_len = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)));
+
+		// Timeout Error: Just retry
+		if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
+			continue;
+
+		// Serious Error: Abort OTA
+		} else if (recv_len <= 0) {
+			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Protocol Error");
+			return ESP_FAIL;
+		}
+
+		// Successful Upload: Flash firmware chunk
+		if (esp_ota_write(ota_handle, (const void *)buf, recv_len) != ESP_OK) {
+			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Flash Error");
+			return ESP_FAIL;
+		}
+
+		remaining -= recv_len;
+	}
+
+	// Validate and switch to new OTA image and reboot
+	if (esp_ota_end(ota_handle) != ESP_OK || esp_ota_set_boot_partition(ota_partition) != ESP_OK) {
+			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Validation / Activation Error");
+			return ESP_FAIL;
+	}
+
+	httpd_resp_sendstr(req, "Firmware update complete, rebooting now!\n");
+
+	vTaskDelay(500 / portTICK_PERIOD_MS);
+	esp_restart();
+
+	return ESP_OK;
 }
 
-void advanced_ota_example_task(void *pvParameter)
+/*
+ * HTTP Server
+ */
+httpd_uri_t index_get = {
+	.uri	  = "/",
+	.method   = HTTP_GET,
+	.handler  = index_get_handler,
+	.user_ctx = NULL
+};
+
+httpd_uri_t update_post = {
+	.uri	  = "/update",
+	.method   = HTTP_POST,
+	.handler  = update_post_handler,
+	.user_ctx = NULL
+};
+
+static esp_err_t http_server_init(void)
 {
-    ESP_LOGI(TAG, "Starting Advanced OTA example");
+	static httpd_handle_t http_server = NULL;
 
-    esp_err_t ota_finish_err = ESP_OK;
-    esp_http_client_config_t config = {
-        .url = "",
-        .cert_pem = (char *)server_cert_pem_start,
-        .timeout_ms = 5000,
-        .keep_alive_enable = true,
-    };
+	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 
-#ifdef CONFIG_EXAMPLE_FIRMWARE_UPGRADE_URL_FROM_STDIN
-    char url_buf[OTA_URL_SIZE];
-    if (strcmp(config.url, "FROM_STDIN") == 0) {
-        example_configure_stdin_stdout();
-        fgets(url_buf, OTA_URL_SIZE, stdin);
-        int len = strlen(url_buf);
-        url_buf[len - 1] = '\0';
-        config.url = url_buf;
-    } else {
-        ESP_LOGE(TAG, "Configuration mismatch: wrong firmware upgrade image url");
-        abort();
-    }
-#endif
+	if (httpd_start(&http_server, &config) == ESP_OK) {
+		httpd_register_uri_handler(http_server, &index_get);
+		httpd_register_uri_handler(http_server, &update_post);
+	}
 
-#ifdef CONFIG_EXAMPLE_SKIP_COMMON_NAME_CHECK
-    config.skip_cert_common_name_check = true;
-#endif
-
-    esp_https_ota_config_t ota_config = {
-        .http_config = &config,
-        .http_client_init_cb = _http_client_init_cb, // Register a callback to be invoked after esp_http_client is initialized
-#ifdef CONFIG_EXAMPLE_ENABLE_PARTIAL_HTTP_DOWNLOAD
-        .partial_http_download = true,
-        .max_http_request_size = CONFIG_EXAMPLE_HTTP_REQUEST_SIZE,
-#endif
-    };
-
-    esp_https_ota_handle_t https_ota_handle = NULL;
-    esp_err_t err = esp_https_ota_begin(&ota_config, &https_ota_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ESP HTTPS OTA Begin failed");
-        vTaskDelete(NULL);
-    }
-
-    esp_app_desc_t app_desc;
-    err = esp_https_ota_get_img_desc(https_ota_handle, &app_desc);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_https_ota_read_img_desc failed");
-        goto ota_end;
-    }
-    err = validate_image_header(&app_desc);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "image header verification failed");
-        goto ota_end;
-    }
-
-    while (1) {
-        err = esp_https_ota_perform(https_ota_handle);
-        if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
-            break;
-        }
-        // esp_https_ota_perform returns after every read operation which gives user the ability to
-        // monitor the status of OTA upgrade by calling esp_https_ota_get_image_len_read, which gives length of image
-        // data read so far.
-        ESP_LOGD(TAG, "Image bytes read: %d", esp_https_ota_get_image_len_read(https_ota_handle));
-    }
-
-    if (esp_https_ota_is_complete_data_received(https_ota_handle) != true) {
-        // the OTA image was not completely received and user can customise the response to this situation.
-        ESP_LOGE(TAG, "Complete data was not received.");
-    } else {
-        ota_finish_err = esp_https_ota_finish(https_ota_handle);
-        if ((err == ESP_OK) && (ota_finish_err == ESP_OK)) {
-            ESP_LOGI(TAG, "ESP_HTTPS_OTA upgrade successful. Rebooting ...");
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            esp_restart();
-        } else {
-            if (ota_finish_err == ESP_ERR_OTA_VALIDATE_FAILED) {
-                ESP_LOGE(TAG, "Image validation failed, image is corrupted");
-            }
-            ESP_LOGE(TAG, "ESP_HTTPS_OTA upgrade failed 0x%x", ota_finish_err);
-            vTaskDelete(NULL);
-        }
-    }
-
-ota_end:
-    esp_https_ota_abort(https_ota_handle);
-    ESP_LOGE(TAG, "ESP_HTTPS_OTA upgrade failed");
-    vTaskDelete(NULL);
+	return http_server == NULL ? ESP_FAIL : ESP_OK;
 }
 
-void app_update(void)
+/*
+ * WiFi configuration
+ */
+static esp_err_t softap_init(void)
 {
-    ESP_LOGI(TAG, "OTA example app_main start");
-    // Initialize NVS.
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        // 1.OTA app partition table has a smaller NVS partition size than the non-OTA
-        // partition table. This size mismatch may cause NVS initialization to fail.
-        // 2.NVS partition contains data in new format and cannot be recognized by this version of code.
-        // If this happens, we erase NVS partition and initialize NVS again.
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK( err );
+	esp_err_t res = ESP_OK;
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+	res |= esp_netif_init();
+	res |= esp_event_loop_create_default();
+	esp_netif_create_default_wifi_ap();
 
-    /* This helper function configures Wi-Fi or Ethernet, as selected in menuconfig.
-     * Read "Establishing Wi-Fi or Ethernet Connection" section in
-     * examples/protocols/README.md for more information about this function.
-    */
-    ESP_ERROR_CHECK(example_connect());
+	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+	res |= esp_wifi_init(&cfg);
 
-#if defined(CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE)
-    /**
-     * We are treating successful WiFi connection as a checkpoint to cancel rollback
-     * process and mark newly updated firmware image as active. For production cases,
-     * please tune the checkpoint behavior per end application requirement.
-     */
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    esp_ota_img_states_t ota_state;
-    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
-        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-            if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
-                ESP_LOGI(TAG, "App is valid, rollback cancelled successfully");
-            } else {
-                ESP_LOGE(TAG, "Failed to cancel rollback");
-            }
-        }
-    }
-#endif
+	wifi_config_t wifi_config = {
+		.ap = {
+			.ssid = WIFI_SSID,
+			.ssid_len = strlen(WIFI_SSID),
+			.channel = 6,
+			.authmode = WIFI_AUTH_OPEN,
+			.max_connection = 3
+		},
+	};
 
-#if CONFIG_EXAMPLE_CONNECT_WIFI
-#if !CONFIG_BT_ENABLED
-    /* Ensure to disable any WiFi power save mode, this allows best throughput
-     * and hence timings for overall OTA operation.
-     */
-    esp_wifi_set_ps(WIFI_PS_NONE);
-#else
-    /* WIFI_PS_MIN_MODEM is the default mode for WiFi Power saving. When both
-     * WiFi and Bluetooth are running, WiFI modem has to go down, hence we
-     * need WIFI_PS_MIN_MODEM. And as WiFi modem goes down, OTA download time
-     * increases.
-     */
-    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-#endif // CONFIG_BT_ENABLED
-#endif // CONFIG_EXAMPLE_CONNECT_WIFI
+	res |= esp_wifi_set_mode(WIFI_MODE_AP);
+	res |= esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config);
+	res |= esp_wifi_start();
 
-#if CONFIG_BT_BLE_ENABLED || CONFIG_BT_NIMBLE_ENABLED
-    esp_ble_helper_init();
-#endif
+	return res;
+}
 
-    xTaskCreate(&advanced_ota_example_task, "advanced_ota_example_task", 1024 * 8, NULL, 5, NULL);
+void app_ota(void) {
+	esp_err_t ret = nvs_flash_init();
+
+	if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+		ESP_ERROR_CHECK(nvs_flash_erase());
+		ret = nvs_flash_init();
+	}
+
+	ESP_ERROR_CHECK(ret);
+	ESP_ERROR_CHECK(softap_init());
+	ESP_ERROR_CHECK(http_server_init());
+
+	/* Mark current app as valid */
+	const esp_partition_t *partition = esp_ota_get_running_partition();
+	printf("Currently running partition: %s\r\n", partition->label);
+
+	esp_ota_img_states_t ota_state;
+	if (esp_ota_get_state_partition(partition, &ota_state) == ESP_OK) {
+		if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+			esp_ota_mark_app_valid_cancel_rollback();
+		}
+	}
+
+	while(1) vTaskDelay(10);
 }

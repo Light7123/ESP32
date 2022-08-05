@@ -14,7 +14,7 @@
 #include "websocket_server.h"
 
 
-#define ESP_WIFI_SSID      "RT-Test"
+#define ESP_WIFI_SSID      "OTA-Test"
 #define ESP_WIFI_PASS      "12345678"
 #define ESP_WIFI_CHANNEL   1 //                               (от 1 до 13)
 #define MAX_STA_CONN       WEBSOCKET_SERVER_MAX_CLIENTS
