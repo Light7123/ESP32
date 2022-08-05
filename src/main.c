@@ -43,6 +43,7 @@ void app_main(void)
   xTaskCreate(&server_handle_task, "server_handle_task", 4096, NULL, 6, NULL);
   //xTaskCreate(&count_task, "count_task", 12000, NULL, 2, NULL);
   xTaskCreate(&transmitUART_task, "transmitUART_task", 4096, NULL, 2, NULL);
+
   (void)start_webserver();
   
 
